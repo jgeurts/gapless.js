@@ -199,6 +199,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
 
         // Remove event hook since the active audio element will become a buffer
         audio.oncanplaythrough = null;
+        audio.currentTime = 0;
       }
 
       if (this.state.previousTracks.length) {
@@ -383,6 +384,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
 
       audio.volume = this.state.volume;
       audio.src = nextTrack.url;
+      audio.currentTime = 0;
 
       // Destroy the previous track audio element
       if (!manualNextTrack) {
