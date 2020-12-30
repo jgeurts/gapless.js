@@ -330,10 +330,10 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
           this.nonShuffledNextTracks = this.state.nextTracks;
         }
       }
+    }
 
-      if (nextTrack && this.state.currentTrack) {
-        this.state.previousTracks = [this.state.currentTrack, ...this.state.previousTracks];
-      }
+    if (this.state.currentTrack && (!nextTrack || this.state.currentTrack.id !== nextTrack.id)) {
+      this.state.previousTracks = [this.state.currentTrack, ...this.state.previousTracks];
     }
 
     if (nextTrack) {
