@@ -404,7 +404,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
       }
 
       await this.play();
-    } else {
+    } else if (this.state.currentTrack) {
       this.state.currentTrack = undefined;
       this.triggerOnStateChange();
     }
