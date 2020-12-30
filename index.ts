@@ -4,12 +4,12 @@ export enum RepeatMode {
   repeatFull = 2,
 }
 
-export interface PlaybackTrack {
+export interface PlayerTrack {
   id: string;
   url: string;
 }
 
-interface PlayerState<Track extends PlaybackTrack = PlaybackTrack> {
+interface PlayerState<Track extends PlayerTrack = PlayerTrack> {
   volume: number;
   isPaused: boolean;
   position: number;
@@ -24,26 +24,64 @@ interface PlayerState<Track extends PlaybackTrack = PlaybackTrack> {
   previousTracks: Track[];
 }
 
-interface PlaybackError {
+interface PlayerError<Track extends PlayerTrack = PlayerTrack> {
   message: string;
+  track?: Track;
+  event?: Event | string;
+  error?: Error;
 }
 
-interface PlayerParams {
+interface PlayerParams<Track extends PlayerTrack = PlayerTrack> {
   volume: number;
-  onStateChanged?: (state: PlayerState) => void;
-  onError?: <T extends PlaybackError>(error: T) => void;
+  onTrackStart?: (track: Track) => void;
+  onTrackEnd?: (track: Track) => void;
+  onStateChanged?: (state: PlayerState<Track>) => void;
+  onError?: (error: PlayerError<Track>) => void;
   // Optionally override default shuffle logic
-  shuffle?: (nonShuffledNextTracks: PlaybackTrack[], state: PlayerState) => PlaybackTrack[];
+  shuffle?: (nonShuffledNextTracks: Track[], state: PlayerState<Track>) => Track[];
 }
 
-export class Player<Track extends PlaybackTrack = PlaybackTrack> {
-  private readonly state: PlayerState;
+export function getTimeDisplay(seconds: number): string {
+  let remainingTime = seconds;
+  if (!Number.isFinite(seconds)) {
+    remainingTime = 0;
+  }
 
-  private readonly onStateChanged?: (state: PlayerState) => void;
+  let result = '';
+  if (seconds >= 3600) {
+    remainingTime %= 3600;
+    result += `${Math.floor(seconds / 3600)}:`;
+  }
 
-  private readonly onError?: <T extends PlaybackError>(error: T) => void;
+  const minutes = Math.floor(remainingTime / 60);
+  remainingTime %= 60;
+  if (result && minutes < 10) {
+    result += '0';
+  }
 
-  private readonly shuffle?: (nonShuffledNextTracks: PlaybackTrack[], state: PlayerState) => PlaybackTrack[];
+  result += `${minutes}:`;
+
+  if (remainingTime < 10) {
+    result += '0';
+  }
+
+  result += Math.floor(remainingTime);
+
+  return result;
+}
+
+export class Player<Track extends PlayerTrack = PlayerTrack> {
+  private readonly state: PlayerState<Track>;
+
+  private readonly onTrackStart?: (track: Track) => void;
+
+  private readonly onTrackEnd?: (track: Track) => void;
+
+  private readonly onStateChanged?: (state: PlayerState<Track>) => void;
+
+  private readonly onError?: (error: PlayerError<Track>) => void;
+
+  private readonly shuffle?: (nonShuffledNextTracks: Track[], state: PlayerState<Track>) => Track[];
 
   private isAudio1Active = true;
 
@@ -51,9 +89,9 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
 
   private audio2: HTMLAudioElement | null;
 
-  private nonShuffledNextTracks: PlaybackTrack[] = [];
+  private nonShuffledNextTracks: Track[] = [];
 
-  public constructor({ volume, onStateChanged, onError, shuffle }: PlayerParams) {
+  public constructor({ volume, onTrackStart, onTrackEnd, onStateChanged, onError, shuffle }: PlayerParams<Track>) {
     this.audio1 = null;
     this.audio2 = null;
 
@@ -68,6 +106,8 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
       previousTracks: [],
     };
 
+    this.onTrackStart = onTrackStart;
+    this.onTrackEnd = onTrackEnd;
     this.onStateChanged = onStateChanged;
     this.onError = onError;
 
@@ -134,6 +174,10 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
       const audio = this.activeAudioElement;
       if (audio) {
         audio.pause();
+      }
+
+      if (!this.state.isPaused) {
+        this.state.isPaused = true;
         this.triggerOnStateChange();
       }
     } catch (ex) {
@@ -148,6 +192,8 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
       const audio = this.activeAudioElement;
       if (audio) {
         await audio.play();
+        this.state.isPaused = false;
+
         this.triggerOnStateChange();
       } else {
         await this.playNextTrack(this.state.currentTrack);
@@ -193,6 +239,10 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
         if (audio.currentTime >= 3 || !this.state.previousTracks.length) {
           audio.currentTime = 0;
 
+          if (this.state.currentTrack) {
+            this.triggerOnTrackStart();
+          }
+
           await this.play();
           return;
         }
@@ -206,11 +256,13 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
         // If a song was playing, prepend it back to to nextTracks
         if (this.state.currentTrack) {
           this.state.nextTracks = [this.state.currentTrack, ...this.state.nextTracks];
+
+          this.triggerOnTrackEnd(this.state.currentTrack);
         }
 
         // Pop last played track and make it the current track
+        // NOTE: saving to currentTrack to prevent playNextTrack from re-adding to previousTracks
         this.state.currentTrack = this.state.previousTracks.shift();
-
         await this.playNextTrack(this.state.currentTrack);
       }
     } catch (ex) {
@@ -225,6 +277,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
       const audio = this.activeAudioElement;
       if (audio) {
         audio.pause();
+        this.state.isPaused = true;
       }
 
       await this.playNextTrack();
@@ -236,14 +289,21 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
   }
 
   public queuePriorityTracks(tracks: Track[]): void {
+    const hadPriorityTracks = !!this.state.priorityTracks.length;
     this.state.priorityTracks = [...this.state.priorityTracks, ...tracks];
 
-    // TODO: Update audio buffer
+    // If there were no previous priority tracks, replace buffer with first priority track
+    if (!hadPriorityTracks) {
+      if ((this.isAudio1Active && this.audio2) || (!this.isAudio1Active && this.audio1)) {
+        this.bufferNextTrack();
+      }
+    }
+
     this.triggerOnStateChange();
   }
 
   public removePriorityTrack(id: string): void {
-    this.state.priorityTracks = this.state.priorityTracks.filter((track) => track.id !== id);
+    this.state.priorityTracks = this.state.priorityTracks.filter((track: Track): boolean => track.id !== id);
     this.triggerOnStateChange();
   }
 
@@ -255,7 +315,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
   /**
    * NOTE: This will clear priorityTracks and previousTracks. If playIndex is specified, tracks before playIndex
    * will be assigned to previousTracks.
-   * @param {Track[]} tracks
+   * @param {object[]} tracks
    * @param {number} [playIndex=0]
    */
   public async playTracks(tracks: Track[], playIndex = 0): Promise<void> {
@@ -288,7 +348,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
     return this.audio2;
   }
 
-  private onProgress(): void {
+  private onPlayerProgress(): void {
     const audio = this.activeAudioElement;
     if (audio) {
       this.state.position = audio.currentTime;
@@ -299,7 +359,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
     this.triggerOnStateChange();
   }
 
-  private onTrackEnd(): void {
+  private onPlayerTrackEnd(): void {
     switch (this.state.repeatMode) {
       case RepeatMode.repeatOnce:
         this.setRepeatMode(RepeatMode.noRepeat);
@@ -317,7 +377,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
     }
   }
 
-  private async playNextTrack(manualNextTrack?: PlaybackTrack): Promise<void> {
+  private async playNextTrack(manualNextTrack?: Track): Promise<void> {
     let nextTrack = manualNextTrack;
 
     if (!nextTrack) {
@@ -334,6 +394,8 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
 
     if (this.state.currentTrack && (!nextTrack || this.state.currentTrack.id !== nextTrack.id)) {
       this.state.previousTracks = [this.state.currentTrack, ...this.state.previousTracks];
+
+      this.triggerOnTrackEnd(this.state.currentTrack);
     }
 
     if (nextTrack) {
@@ -375,11 +437,11 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
       };
 
       audio.onprogress = (): void => {
-        this.onProgress();
+        this.onPlayerProgress();
       };
 
       audio.onended = (): void => {
-        this.onTrackEnd();
+        this.onPlayerTrackEnd();
       };
 
       audio.volume = this.state.volume;
@@ -403,6 +465,8 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
         }
       }
 
+      this.triggerOnTrackStart();
+
       await this.play();
     } else if (this.state.currentTrack) {
       this.state.currentTrack = undefined;
@@ -411,7 +475,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
   }
 
   private bufferNextTrack(): void {
-    let nextTrack: PlaybackTrack | undefined;
+    let nextTrack: Track | undefined;
     if (this.state.priorityTracks.length) {
       [nextTrack] = this.state.priorityTracks.slice(0, 1);
     } else if (this.state.nextTracks.length) {
@@ -471,7 +535,7 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
     }
   }
 
-  private defaultShuffle(nonShuffledNextTracks: PlaybackTrack[]): PlaybackTrack[] {
+  private defaultShuffle(nonShuffledNextTracks: Track[]): Track[] {
     const shuffledTrackList = nonShuffledNextTracks.slice();
     let currentIndex = shuffledTrackList.length;
 
@@ -488,9 +552,21 @@ export class Player<Track extends PlaybackTrack = PlaybackTrack> {
     return shuffledTrackList;
   }
 
+  private triggerOnTrackStart(): void {
+    if (this.onTrackStart && this.state.currentTrack) {
+      this.onTrackStart(this.state.currentTrack);
+    }
+  }
+
+  private triggerOnTrackEnd(track: Track): void {
+    if (this.onTrackEnd) {
+      this.onTrackEnd(track);
+    }
+  }
+
   private triggerOnStateChange(): void {
     if (this.onStateChanged) {
-      this.onStateChanged(this.state);
+      this.onStateChanged({ ...this.state });
     }
   }
 }
