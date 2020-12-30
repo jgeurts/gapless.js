@@ -1,630 +1,494 @@
-enum PlaybackType {
-  html5,
-  webaudio,
+export enum RepeatMode {
+  noRepeat = 0,
+  repeatOnce = 1,
+  repeatFull = 2,
 }
 
-enum PlaybackLoadingState {
-  none,
-  loading,
-  loaded,
+export interface PlaybackTrack {
+  id: string;
+  url: string;
 }
 
-export interface QueueOptions {
-  onProgress?: () => void;
-  onEnded?: () => void;
-  onPlayNextTrack?: () => void;
-  onPlayPreviousTrack?: () => void;
-  onStartNewTrack?: () => void;
-  webAudioIsDisabled?: boolean;
-  fetchMode?: 'cors' | 'no-cors' | 'same-origin';
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  debug?: ((message: string, ...optionalParams: any[]) => void) | null;
-  numberOfTracksToPreload?: number;
-}
-
-interface QueueState {
+interface PlayerState<Track extends PlaybackTrack = PlaybackTrack> {
   volume: number;
-  currentTrackIndex: number;
-  webAudioIsDisabled: boolean;
+  isPaused: boolean;
+  position: number;
+  repeatMode: RepeatMode;
+  isShuffled: boolean;
+  currentTrack?: Track;
+  // Priority tracks are not affected by shuffle
+  priorityTracks: Track[];
+  // Tracks next up in the queue
+  nextTracks: Track[];
+  // Tracks previously played or skipped due to play index
+  previousTracks: Track[];
 }
 
-interface QueueProps<TTrack> {
-  onProgress?: (track: Track<TTrack>) => void;
-  onEnded?: () => void;
-  onPlayNextTrack?: (track: Track<TTrack>) => void;
-  onPlayPreviousTrack?: (track: Track<TTrack>) => void;
-  onStartNewTrack?: (track: Track<TTrack>) => void;
+interface PlaybackError {
+  message: string;
 }
 
-interface WithWebkitAudioContext {
-  webkitAudioContext: AudioContext;
+interface PlayerParams {
+  volume: number;
+  onStateChanged?: (state: PlayerState) => void;
+  onError?: <T extends PlaybackError>(error: T) => void;
+  // Optionally override default shuffle logic
+  shuffle?: (nonShuffledNextTracks: PlaybackTrack[], state: PlayerState) => PlaybackTrack[];
 }
 
-const AudioContext = globalThis.AudioContext || ((globalThis as unknown) as WithWebkitAudioContext).webkitAudioContext;
+export class Player<Track extends PlaybackTrack = PlaybackTrack> {
+  private readonly state: PlayerState;
 
-export class Queue<TTrackMetadata> {
-  private props: QueueProps<TTrackMetadata>;
+  private readonly onStateChanged?: (state: PlayerState) => void;
 
-  private numberOfTracksToPreload: number;
+  private readonly onError?: <T extends PlaybackError>(error: T) => void;
 
-  public readonly tracks: Track<TTrackMetadata>[] = [];
+  private readonly shuffle?: (nonShuffledNextTracks: PlaybackTrack[], state: PlayerState) => PlaybackTrack[];
 
-  public state: QueueState;
+  private isAudio1Active = true;
 
-  public readonly fetchMode?: 'cors' | 'no-cors' | 'same-origin';
+  private audio1: HTMLAudioElement | null;
 
-  public constructor({ onProgress, onEnded, onPlayNextTrack, onPlayPreviousTrack, onStartNewTrack, webAudioIsDisabled = false, numberOfTracksToPreload = 2, fetchMode = 'cors' }: QueueOptions = {}) {
-    this.props = {
-      onProgress,
-      onEnded,
-      onPlayNextTrack,
-      onPlayPreviousTrack,
-      onStartNewTrack,
-    };
-    this.fetchMode = fetchMode;
+  private audio2: HTMLAudioElement | null;
 
-    this.numberOfTracksToPreload = numberOfTracksToPreload;
+  private nonShuffledNextTracks: PlaybackTrack[] = [];
+
+  public constructor({ volume, onStateChanged, onError, shuffle }: PlayerParams) {
+    this.audio1 = null;
+    this.audio2 = null;
 
     this.state = {
-      volume: 1,
-      currentTrackIndex: 0,
-      webAudioIsDisabled,
-    };
-  }
-
-  public addTrack({ trackUrl, metadata = {} as TTrackMetadata }: { trackUrl: string; metadata: TTrackMetadata }): void {
-    this.tracks.push(
-      // eslint-disable-next-line @typescript-eslint/no-use-before-define
-      new Track({
-        trackUrl,
-        metadata,
-        index: this.tracks.length,
-        queue: this,
-      }),
-    );
-  }
-
-  public removeTrack(track: Track<TTrackMetadata>): void {
-    const index = this.tracks.indexOf(track);
-    this.tracks.splice(index, 1);
-  }
-
-  public async togglePlayPause(): Promise<void> {
-    if (this.currentTrack) {
-      await this.currentTrack.togglePlayPause();
-    }
-  }
-
-  public async play(): Promise<void> {
-    if (this.currentTrack) {
-      await this.currentTrack.play();
-    }
-  }
-
-  public pause(): void {
-    if (this.currentTrack) {
-      this.currentTrack.pause();
-    }
-  }
-
-  public async playPrevious(): Promise<void> {
-    this.resetCurrentTrack();
-
-    this.state.currentTrackIndex = Math.max(this.state.currentTrackIndex - 1, 0);
-
-    this.resetCurrentTrack();
-
-    if (this.currentTrack) {
-      await this.play();
-
-      if (this.props.onStartNewTrack) {
-        this.props.onStartNewTrack(this.currentTrack);
-      }
-
-      if (this.props.onPlayPreviousTrack) {
-        this.props.onPlayPreviousTrack(this.currentTrack);
-      }
-    }
-  }
-
-  public async playNext(): Promise<void> {
-    this.resetCurrentTrack();
-
-    this.state.currentTrackIndex += 1;
-
-    this.resetCurrentTrack();
-
-    if (this.currentTrack) {
-      await this.play();
-
-      if (this.props.onStartNewTrack) {
-        this.props.onStartNewTrack(this.currentTrack);
-      }
-
-      if (this.props.onPlayNextTrack) {
-        this.props.onPlayNextTrack(this.currentTrack);
-      }
-    }
-  }
-
-  public resetCurrentTrack(): void {
-    if (this.currentTrack) {
-      this.currentTrack.seek(0);
-      this.currentTrack.pause();
-    }
-  }
-
-  public pauseAll(): void {
-    for (const track of this.tracks) {
-      track.pause();
-    }
-  }
-
-  public async gotoTrack(trackIndex: number, playImmediately = false): Promise<void> {
-    this.pauseAll();
-    this.state.currentTrackIndex = trackIndex;
-
-    this.resetCurrentTrack();
-
-    if (playImmediately && this.currentTrack) {
-      await this.play();
-
-      if (this.props.onStartNewTrack) {
-        this.props.onStartNewTrack(this.currentTrack);
-      }
-    }
-  }
-
-  public loadTrack(trackIndex: number, useHtmlAudioPreloading = false): void {
-    // only preload if song is within the next 2
-    if (this.state.currentTrackIndex + this.numberOfTracksToPreload <= trackIndex) {
-      return;
-    }
-
-    const track = this.tracks[trackIndex];
-
-    if (track) {
-      track.preload(useHtmlAudioPreloading);
-    }
-  }
-
-  // Internal - Used by the track to notify when it has ended
-  public notifyTrackEnded(): void {
-    if (this.props.onEnded) {
-      this.props.onEnded();
-    }
-  }
-
-  // Internal - Used by the track to notify when progress has updated
-  public notifyTrackProgressUpdated(): void {
-    if (this.props.onProgress && this.currentTrack) {
-      this.props.onProgress(this.currentTrack);
-    }
-  }
-
-  public get currentTrack(): Track<TTrackMetadata> | undefined {
-    if (this.state.currentTrackIndex < this.tracks.length) {
-      return this.tracks[this.state.currentTrackIndex];
-    }
-
-    return undefined;
-  }
-
-  public get nextTrack(): Track<TTrackMetadata> {
-    return this.tracks[this.state.currentTrackIndex + 1];
-  }
-
-  public disableWebAudio(): void {
-    this.state.webAudioIsDisabled = true;
-  }
-
-  public setVolume(volume: number): void {
-    if (volume < 0) {
-      volume = 0;
-    } else if (volume > 1) {
-      volume = 1;
-    }
-
-    this.state.volume = volume;
-
-    for (const track of this.tracks) {
-      track.setVolume(volume);
-    }
-  }
-}
-
-interface TrackOptions<TTrackMetadata> {
-  trackUrl: string;
-  queue: Queue<TTrackMetadata>;
-  index: number;
-  metadata: TTrackMetadata;
-}
-
-interface LimitedTrackState {
-  playbackType: PlaybackType;
-  webAudioLoadingState: PlaybackLoadingState;
-}
-
-interface TrackState extends LimitedTrackState {
-  isPaused: boolean;
-  currentTime: number;
-  duration: number;
-  index: number;
-}
-
-export class Track<TTrackMetadata> {
-  private playbackType: PlaybackType;
-
-  private webAudioLoadingState: PlaybackLoadingState;
-
-  private loadedHead: boolean;
-
-  private queue: Queue<TTrackMetadata>;
-
-  private audio: HTMLAudioElement;
-
-  private audioContext: AudioContext;
-
-  private gainNode: GainNode;
-
-  private webAudioStartedPlayingAt: number;
-
-  private webAudioPausedAt: number;
-
-  private webAudioPausedDuration: number;
-
-  private audioBuffer: AudioBuffer | null;
-
-  private bufferSourceNode: AudioBufferSourceNode;
-
-  public metadata: TTrackMetadata;
-
-  public index: number;
-
-  public trackUrl: string;
-
-  public constructor({ trackUrl, queue, index, metadata }: TrackOptions<TTrackMetadata>) {
-    // playback type state
-    this.playbackType = PlaybackType.html5;
-    this.webAudioLoadingState = PlaybackLoadingState.none;
-    this.loadedHead = false;
-
-    // basic inputs from Queue
-    this.index = index;
-    this.queue = queue;
-    this.trackUrl = trackUrl;
-    this.metadata = metadata;
-
-    // this.onEnded = this.onEnded.bind(this);
-    // this.onProgress = this.onProgress.bind(this);
-
-    // HTML5 Audio
-    this.audio = new Audio();
-    this.audio.onerror = (e: Event | string): void => {
-      this.debug('audioOnError', e);
+      volume,
+      isPaused: true,
+      position: 0,
+      repeatMode: RepeatMode.noRepeat,
+      isShuffled: false,
+      priorityTracks: [],
+      nextTracks: [],
+      previousTracks: [],
     };
 
-    this.audio.onended = (): void => {
-      this.notifyTrackEnd();
-    };
-    this.audio.controls = false;
-    this.audio.volume = this.queue.state.volume;
-    this.audio.preload = 'none';
-    this.audio.src = trackUrl;
-    // this.audio.onprogress = () => this.debug(this.index, this.audio.buffered)
+    this.onStateChanged = onStateChanged;
+    this.onError = onError;
 
-    // WebAudio
-    this.audioContext = new AudioContext();
-    this.gainNode = this.audioContext.createGain();
-    this.gainNode.gain.value = this.queue.state.volume;
-    this.webAudioStartedPlayingAt = 0;
-    this.webAudioPausedDuration = 0;
-    this.webAudioPausedAt = 0;
-    this.audioBuffer = null;
-
-    this.bufferSourceNode = this.audioContext.createBufferSource();
-    this.bufferSourceNode.onended = (): void => {
-      this.notifyTrackEnd();
-    };
+    this.shuffle = shuffle;
   }
 
-  public pause(): void {
-    this.debug('pause');
-    if (this.isUsingWebAudio) {
-      if (this.bufferSourceNode.playbackRate.value === 0) {
-        return;
+  public setVolume(volumePercent: number): void {
+    try {
+      this.state.volume = volumePercent;
+      const volume = volumePercent / 100;
+      if (this.audio1) {
+        this.audio1.volume = volume;
       }
 
-      this.webAudioPausedAt = this.audioContext.currentTime;
-      this.bufferSourceNode.playbackRate.value = 0;
-      this.gainNode.disconnect(this.audioContext.destination);
+      if (this.audio2) {
+        this.audio2.volume = volume;
+      }
+
+      this.triggerOnStateChange();
+    } catch (ex) {
+      if (this.onError) {
+        this.onError(ex);
+      }
+    }
+  }
+
+  public setRepeatMode(repeatMode: RepeatMode): void {
+    try {
+      this.state.repeatMode = repeatMode;
+      const audio = this.activeAudioElement;
+
+      if (audio) {
+        audio.loop = repeatMode !== RepeatMode.noRepeat;
+      }
+
+      this.triggerOnStateChange();
+    } catch (ex) {
+      if (this.onError) {
+        this.onError(ex);
+      }
+    }
+  }
+
+  public enableShuffle(): void {
+    this.state.isShuffled = true;
+    if (this.shuffle) {
+      this.state.nextTracks = this.shuffle(this.nonShuffledNextTracks.slice(), { ...this.state });
     } else {
-      this.audio.pause();
+      this.state.nextTracks = this.defaultShuffle(this.nonShuffledNextTracks);
+    }
+
+    this.triggerOnStateChange();
+  }
+
+  public disableShuffle(): void {
+    this.state.isShuffled = false;
+    this.state.nextTracks = this.nonShuffledNextTracks;
+
+    this.triggerOnStateChange();
+  }
+
+  public pause(): void {
+    try {
+      const audio = this.activeAudioElement;
+      if (audio) {
+        audio.pause();
+        this.triggerOnStateChange();
+      }
+    } catch (ex) {
+      if (this.onError) {
+        this.onError(ex);
+      }
     }
   }
 
   public async play(): Promise<void> {
-    this.debug('play');
-    if (this.audioBuffer) {
-      // if we've already set up the buffer just set playbackRate to 1
-      if (this.isUsingWebAudio) {
-        if (this.bufferSourceNode.playbackRate.value === 1) {
+    try {
+      const audio = this.activeAudioElement;
+      if (audio) {
+        await audio.play();
+        this.triggerOnStateChange();
+      } else {
+        await this.playNextTrack(this.state.currentTrack);
+      }
+    } catch (ex) {
+      if (this.onError) {
+        this.onError(ex);
+      }
+    }
+  }
+
+  public async togglePlay(): Promise<void> {
+    if (this.state.isPaused) {
+      await this.play();
+    } else {
+      this.pause();
+    }
+  }
+
+  public seek(position: number): void {
+    try {
+      const audio = this.activeAudioElement;
+      if (audio) {
+        audio.currentTime = Math.max(0, position);
+
+        this.triggerOnStateChange();
+      }
+    } catch (ex) {
+      if (this.onError) {
+        this.onError(ex);
+      }
+    }
+  }
+
+  public async previousTrack(): Promise<void> {
+    try {
+      const audio = this.activeAudioElement;
+      if (audio) {
+        audio.pause();
+
+        // If the current song has played for more than 3 seconds, rewind it to the beginning
+        // If there are no previously played tracks, rewind the current track
+        if (audio.currentTime >= 3 || !this.state.previousTracks.length) {
+          audio.currentTime = 0;
+
+          await this.play();
           return;
         }
 
-        if (this.webAudioPausedAt) {
-          this.webAudioPausedDuration += this.audioContext.currentTime - this.webAudioPausedAt;
+        // Remove event hook since the active audio element will become a buffer
+        audio.oncanplaythrough = null;
+      }
+
+      if (this.state.previousTracks.length) {
+        // If a song was playing, prepend it back to to nextTracks
+        if (this.state.currentTrack) {
+          this.state.nextTracks = [this.state.currentTrack, ...this.state.nextTracks];
         }
 
-        // use seek to avoid bug where track wouldn't play properly
-        // if paused for longer than length of track
-        // TODO: fix bug -- must be related to bufferSourceNode
-        this.seek(this.currentTime);
-        // was paused, now force play
-        this.connectGainNode();
-        this.bufferSourceNode.playbackRate.value = 1;
+        // Pop last played track and make it the current track
+        this.state.currentTrack = this.state.previousTracks.shift();
 
-        this.webAudioPausedAt = 0;
-      } else {
-        // otherwise set the bufferSourceNode buffer and switch to WebAudio
-        this.switchToWebAudio();
-      }
-
-      // Try to preload the next track
-      this.queue.loadTrack(this.index + 1);
-    } else {
-      this.audio.preload = 'auto';
-      await this.audio.play();
-      if (!this.queue.state.webAudioIsDisabled) {
-        // Fire and forget
-        this.loadHEAD()
-          .then(() => {
-            void this.loadBuffer();
-            return true;
-          })
-          .catch(() => undefined);
-      }
-    }
-
-    this.onProgress();
-  }
-
-  public async togglePlayPause(): Promise<void> {
-    if (this.isPaused) {
-      await this.play();
-    } else {
-      this.pause();
-    }
-  }
-
-  public preload(useHtmlAudioPreloading = false): void {
-    this.debug('preload', useHtmlAudioPreloading);
-    if (useHtmlAudioPreloading) {
-      this.audio.preload = 'auto';
-    } else if (!this.audioBuffer && !this.queue.state.webAudioIsDisabled) {
-      // Fire and forget
-      this.loadHEAD()
-        .then(() => {
-          void this.loadBuffer();
-          return true;
-        })
-        .catch(() => undefined);
-    }
-  }
-
-  // TODO: add checks for to > duration or null or negative (duration - to)
-  public seek(to = 0): void {
-    if (this.isUsingWebAudio) {
-      this.seekBufferSourceNode(to);
-    } else {
-      this.audio.currentTime = to;
-    }
-
-    this.onProgress();
-  }
-
-  public connectGainNode(): void {
-    this.gainNode.connect(this.audioContext.destination);
-  }
-
-  public setVolume(volume: number): void {
-    this.audio.volume = volume;
-    if (this.gainNode) {
-      this.gainNode.gain.value = volume;
-    }
-  }
-
-  // getter helpers
-  public get isUsingWebAudio(): boolean {
-    return this.playbackType === PlaybackType.webaudio;
-  }
-
-  public get isPaused(): boolean {
-    if (this.isUsingWebAudio) {
-      return this.bufferSourceNode.playbackRate.value === 0;
-    }
-
-    return this.audio.paused;
-  }
-
-  public get currentTime(): number {
-    if (this.isUsingWebAudio) {
-      return this.audioContext.currentTime - this.webAudioStartedPlayingAt - this.webAudioPausedDuration;
-    }
-
-    return this.audio.currentTime;
-  }
-
-  public get duration(): number {
-    if (this.isUsingWebAudio && this.audioBuffer) {
-      return this.audioBuffer.duration;
-    }
-
-    return this.audio.duration;
-  }
-
-  public get isActiveTrack(): boolean {
-    return this.queue.currentTrack?.index === this.index;
-  }
-
-  public get isLoaded(): boolean {
-    return this.webAudioLoadingState === PlaybackLoadingState.loaded;
-  }
-
-  public get state(): LimitedTrackState {
-    return {
-      playbackType: this.playbackType,
-      webAudioLoadingState: this.webAudioLoadingState,
-    };
-  }
-
-  public get completeState(): TrackState {
-    return {
-      playbackType: this.playbackType,
-      webAudioLoadingState: this.webAudioLoadingState,
-      isPaused: this.isPaused,
-      currentTime: this.currentTime,
-      duration: this.duration,
-      index: this.index,
-    };
-  }
-
-  private async loadHEAD(): Promise<void> {
-    if (this.loadedHead) {
-      return;
-    }
-
-    const { redirected, url } = await fetch(this.trackUrl, {
-      method: 'HEAD',
-      mode: this.queue.fetchMode,
-    });
-
-    if (redirected) {
-      this.trackUrl = url;
-    }
-
-    this.loadedHead = true;
-  }
-
-  private async loadBuffer(): Promise<void> {
-    try {
-      if (this.webAudioLoadingState !== PlaybackLoadingState.none) {
-        return;
-      }
-
-      this.webAudioLoadingState = PlaybackLoadingState.loading;
-
-      const response = await fetch(this.trackUrl, {
-        mode: this.queue.fetchMode,
-      });
-      const buffer = await response.arrayBuffer();
-      this.audioBuffer = await this.audioContext.decodeAudioData(buffer);
-
-      this.webAudioLoadingState = PlaybackLoadingState.loaded;
-      this.bufferSourceNode.buffer = this.audioBuffer;
-      this.bufferSourceNode.connect(this.gainNode);
-
-      // try to preload next track
-      this.queue.loadTrack(this.index + 1);
-
-      // if we loaded the active track, switch to web audio
-      if (this.isActiveTrack) {
-        this.switchToWebAudio();
+        await this.playNextTrack(this.state.currentTrack);
       }
     } catch (ex) {
-      this.debug(`Error fetching buffer: ${this.trackUrl}`, ex);
+      if (this.onError) {
+        this.onError(ex);
+      }
     }
   }
 
-  private switchToWebAudio(): void {
-    // if we've switched tracks, don't switch to web audio
-    if (!this.isActiveTrack || !this.audioBuffer) {
-      return;
+  public async nextTrack(): Promise<void> {
+    try {
+      const audio = this.activeAudioElement;
+      if (audio) {
+        audio.pause();
+      }
+
+      await this.playNextTrack();
+    } catch (ex) {
+      if (this.onError) {
+        this.onError(ex);
+      }
+    }
+  }
+
+  public queuePriorityTracks(tracks: Track[]): void {
+    this.state.priorityTracks = [...this.state.priorityTracks, ...tracks];
+
+    // TODO: Update audio buffer
+    this.triggerOnStateChange();
+  }
+
+  public removePriorityTrack(id: string): void {
+    this.state.priorityTracks = this.state.priorityTracks.filter((track) => track.id !== id);
+    this.triggerOnStateChange();
+  }
+
+  public clearPriorityTracks(): void {
+    this.state.priorityTracks = [];
+    this.triggerOnStateChange();
+  }
+
+  /**
+   * NOTE: This will clear priorityTracks and previousTracks. If playIndex is specified, tracks before playIndex
+   * will be assigned to previousTracks.
+   * @param {Track[]} tracks
+   * @param {number} [playIndex=0]
+   */
+  public async playTracks(tracks: Track[], playIndex = 0): Promise<void> {
+    const audio = this.activeAudioElement;
+    if (audio) {
+      audio.pause();
     }
 
-    this.debug('switch to web audio', this.currentTime, this.isPaused, this.audio.duration - this.audioBuffer.duration);
+    this.audio1 = null;
+    this.audio2 = null;
+    this.isAudio1Active = true;
 
-    // if currentTime === 0, this is a new track, so play it
-    // otherwise we're hitting this mid-track which may
-    // happen in the middle of a paused track
-    if (this.currentTime && this.isPaused) {
-      this.bufferSourceNode.playbackRate.value = 0;
+    this.state.priorityTracks = [];
+    if (playIndex > 0 && playIndex < tracks.length) {
+      this.state.previousTracks = tracks.slice(0, playIndex - 1);
     } else {
-      this.bufferSourceNode.playbackRate.value = 1;
+      this.state.previousTracks = [];
     }
 
-    this.connectGainNode();
+    this.state.nextTracks = tracks.slice(playIndex);
 
-    this.webAudioStartedPlayingAt = this.audioContext.currentTime - this.currentTime;
-
-    // TODO: slight blip, could be improved
-    this.bufferSourceNode.start(0, this.currentTime);
-    this.audio.pause();
-
-    this.playbackType = PlaybackType.webaudio;
+    await this.play();
   }
 
-  private seekBufferSourceNode(to: number): void {
-    const wasPaused = this.isPaused;
-    this.bufferSourceNode.onended = null;
-    this.bufferSourceNode.stop();
-
-    this.bufferSourceNode = this.audioContext.createBufferSource();
-
-    this.bufferSourceNode.buffer = this.audioBuffer;
-    this.bufferSourceNode.connect(this.gainNode);
-    this.bufferSourceNode.onended = (): void => {
-      this.notifyTrackEnd();
-    };
-
-    this.webAudioStartedPlayingAt = this.audioContext.currentTime - to;
-    this.webAudioPausedDuration = 0;
-
-    this.bufferSourceNode.start(0, to);
-    if (wasPaused) {
-      this.connectGainNode();
-      this.pause();
+  private get activeAudioElement(): HTMLAudioElement | null {
+    if (this.isAudio1Active) {
+      return this.audio1;
     }
-  }
 
-  // basic event handlers
-  private notifyTrackEnd(): void {
-    this.debug('onEnded');
-    // Fire and forget
-    void this.queue.playNext();
-    this.queue.notifyTrackEnded();
+    return this.audio2;
   }
 
   private onProgress(): void {
-    if (!this.isActiveTrack) {
-      return;
+    const audio = this.activeAudioElement;
+    if (audio) {
+      this.state.position = audio.currentTime;
+    } else {
+      this.state.position = 0;
     }
 
-    const durationRemainingInSeconds = this.duration - this.currentTime;
-    const { nextTrack } = this.queue;
-
-    // if in last 25 seconds and next track hasn't loaded yet, load next track using HtmlAudio
-    if (durationRemainingInSeconds <= 25 && nextTrack && !nextTrack.isLoaded) {
-      this.queue.loadTrack(this.index + 1, true);
-    }
-
-    this.queue.notifyTrackProgressUpdated();
-
-    // if we're paused, we still want to send one final onProgress call
-    // and then bow out, hence this being at the end of the function
-    if (this.isPaused) {
-      return;
-    }
-
-    window.requestAnimationFrame((): void => {
-      this.onProgress();
-    });
+    this.triggerOnStateChange();
   }
 
-  // debug helper
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private debug(message: string, ...optionalParams: any[]): void {
-    // eslint-disable-next-line no-console
-    console.log(`${this.index}:${message}`, ...optionalParams, this.state);
+  private onTrackEnd(): void {
+    switch (this.state.repeatMode) {
+      case RepeatMode.repeatOnce:
+        this.setRepeatMode(RepeatMode.noRepeat);
+        break;
+      case RepeatMode.noRepeat:
+        this.playNextTrack().catch((err): void => {
+          if (this.onError) {
+            this.onError(err);
+          }
+        });
+        break;
+      case RepeatMode.repeatFull:
+      default:
+        break;
+    }
+  }
+
+  private async playNextTrack(manualNextTrack?: PlaybackTrack): Promise<void> {
+    let nextTrack = manualNextTrack;
+
+    if (!nextTrack) {
+      if (this.state.priorityTracks.length) {
+        nextTrack = this.state.priorityTracks.shift();
+      } else if (this.state.nextTracks.length) {
+        nextTrack = this.state.nextTracks.shift();
+
+        if (!this.state.isShuffled) {
+          this.nonShuffledNextTracks = this.state.nextTracks;
+        }
+      }
+
+      if (nextTrack && this.state.currentTrack) {
+        this.state.previousTracks = [this.state.currentTrack, ...this.state.previousTracks];
+      }
+    }
+
+    if (nextTrack) {
+      this.state.currentTrack = nextTrack;
+      this.isAudio1Active = !this.isAudio1Active;
+
+      let audio: HTMLAudioElement;
+      // Create the audio element if it was not previously buffered
+      if (this.isAudio1Active) {
+        if (!this.audio1) {
+          this.audio1 = new Audio();
+        }
+
+        audio = this.audio1;
+      } else {
+        if (!this.audio2) {
+          this.audio2 = new Audio();
+        }
+
+        audio = this.audio2;
+      }
+
+      if (this.onError && !audio.onerror) {
+        audio.onerror = (event: Event | string, _source?: string, _lineno?: number, _colno?: number, error?: Error): void => {
+          if (this.onError) {
+            this.onError(
+              error || {
+                message: `Error loading audio: ${nextTrack ? nextTrack.url : 'Unknown track :('}`,
+                event,
+                error,
+              },
+            );
+          }
+        };
+      }
+
+      audio.oncanplaythrough = (): void => {
+        this.bufferNextTrack();
+      };
+
+      audio.onprogress = (): void => {
+        this.onProgress();
+      };
+
+      audio.onended = (): void => {
+        this.onTrackEnd();
+      };
+
+      audio.volume = this.state.volume;
+      audio.src = nextTrack.url;
+
+      // Destroy the previous track audio element
+      if (!manualNextTrack) {
+        if (this.isAudio1Active && this.audio2) {
+          this.audio2.onerror = null;
+          this.audio2.onprogress = null;
+          this.audio2.onended = null;
+          this.audio2.oncanplaythrough = null;
+          this.audio2 = null;
+        } else if (!this.isAudio1Active && this.audio1) {
+          this.audio1.onerror = null;
+          this.audio1.onprogress = null;
+          this.audio1.onended = null;
+          this.audio1.oncanplaythrough = null;
+          this.audio1 = null;
+        }
+      }
+
+      await this.play();
+    } else {
+      this.state.currentTrack = undefined;
+      this.triggerOnStateChange();
+    }
+  }
+
+  private bufferNextTrack(): void {
+    let nextTrack: PlaybackTrack | undefined;
+    if (this.state.priorityTracks.length) {
+      [nextTrack] = this.state.priorityTracks.slice(0, 1);
+    } else if (this.state.nextTracks.length) {
+      [nextTrack] = this.state.nextTracks.slice(0, 1);
+    }
+
+    if (nextTrack) {
+      let buffer: HTMLAudioElement;
+      if (this.isAudio1Active) {
+        // Destroy previous buffer if it's not buffering the correct track
+        if (this.audio2 && this.audio2.src !== nextTrack.url) {
+          this.audio2.onerror = null;
+          this.audio2.onprogress = null;
+          this.audio2.onended = null;
+          this.audio2.oncanplaythrough = null;
+          this.audio2 = null;
+        }
+
+        if (!this.audio2) {
+          this.audio2 = new Audio();
+        }
+
+        buffer = this.audio2;
+      } else {
+        // Destroy previous buffer if it's not buffering the correct track
+        if (this.audio1 && this.audio1.src !== nextTrack.url) {
+          this.audio1.onerror = null;
+          this.audio1.onprogress = null;
+          this.audio1.onended = null;
+          this.audio1.oncanplaythrough = null;
+          this.audio1 = null;
+        }
+
+        if (!this.audio1) {
+          this.audio1 = new Audio();
+        }
+
+        buffer = this.audio1;
+      }
+
+      if (this.onError && !buffer.onerror) {
+        buffer.onerror = (event: Event | string, _source?: string, _lineno?: number, _colno?: number, error?: Error): void => {
+          if (this.onError) {
+            this.onError(
+              error || {
+                message: `Error loading audio: ${nextTrack ? nextTrack.url : 'Unknown track :('}`,
+                event,
+                error,
+              },
+            );
+          }
+        };
+      }
+
+      buffer.preload = 'auto';
+      buffer.src = nextTrack.url;
+    }
+  }
+
+  private defaultShuffle(nonShuffledNextTracks: PlaybackTrack[]): PlaybackTrack[] {
+    const shuffledTrackList = nonShuffledNextTracks.slice();
+    let currentIndex = shuffledTrackList.length;
+
+    // From: https://stackoverflow.com/a/2450976/3085
+    while (currentIndex !== 0) {
+      const randomIndex = Math.floor(Math.random() * currentIndex);
+      currentIndex -= 1;
+
+      const tempValue = shuffledTrackList[currentIndex];
+      shuffledTrackList[currentIndex] = shuffledTrackList[randomIndex];
+      shuffledTrackList[randomIndex] = tempValue;
+    }
+
+    return shuffledTrackList;
+  }
+
+  private triggerOnStateChange(): void {
+    if (this.onStateChanged) {
+      this.onStateChanged(this.state);
+    }
   }
 }
