@@ -5,7 +5,7 @@ export enum RepeatMode {
 }
 
 export interface PlayerTrack {
-  id: string;
+  uniqueId: string;
   url: string;
 }
 
@@ -13,6 +13,7 @@ interface PlayerState<Track extends PlayerTrack = PlayerTrack> {
   volume: number;
   isPaused: boolean;
   position: number;
+  duration: number;
   repeatMode: RepeatMode;
   isShuffled: boolean;
   currentTrack?: Track;
@@ -27,8 +28,6 @@ interface PlayerState<Track extends PlayerTrack = PlayerTrack> {
 interface PlayerError<Track extends PlayerTrack = PlayerTrack> {
   message: string;
   track?: Track;
-  event?: Event | string;
-  error?: Error;
 }
 
 interface PlayerParams<Track extends PlayerTrack = PlayerTrack> {
@@ -99,6 +98,7 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
       volume,
       isPaused: true,
       position: 0,
+      duration: 0,
       repeatMode: RepeatMode.noRepeat,
       isShuffled: false,
       priorityTracks: [],
@@ -114,7 +114,7 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
     this.shuffle = shuffle;
   }
 
-  public setVolume(volumePercent: number): void {
+  public setVolume(volumePercent: number, triggerStateChange?: boolean): void {
     try {
       this.state.volume = volumePercent;
       const volume = volumePercent / 100;
@@ -126,7 +126,9 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
         this.audio2.volume = volume;
       }
 
-      this.triggerOnStateChange();
+      if (triggerStateChange) {
+        this.triggerOnStateChange();
+      }
     } catch (ex) {
       if (this.onError) {
         this.onError(ex);
@@ -302,8 +304,8 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
     this.triggerOnStateChange();
   }
 
-  public removePriorityTrack(id: string): void {
-    this.state.priorityTracks = this.state.priorityTracks.filter((track: Track): boolean => track.id !== id);
+  public removePriorityTrack(uniqueId: string): void {
+    this.state.priorityTracks = this.state.priorityTracks.filter((track: Track): boolean => track.uniqueId !== uniqueId);
     this.triggerOnStateChange();
   }
 
@@ -352,8 +354,10 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
     const audio = this.activeAudioElement;
     if (audio) {
       this.state.position = audio.currentTime;
+      this.state.duration = audio.duration;
     } else {
       this.state.position = 0;
+      this.state.duration = 0;
     }
 
     this.triggerOnStateChange();
@@ -392,7 +396,7 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
       }
     }
 
-    if (this.state.currentTrack && (!nextTrack || this.state.currentTrack.id !== nextTrack.id)) {
+    if (this.state.currentTrack && (!nextTrack || this.state.currentTrack.uniqueId !== nextTrack.uniqueId)) {
       this.state.previousTracks = [this.state.currentTrack, ...this.state.previousTracks];
 
       this.triggerOnTrackEnd(this.state.currentTrack);
@@ -407,60 +411,58 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
       if (this.isAudio1Active) {
         if (!this.audio1) {
           this.audio1 = new Audio();
+          this.audio1.addEventListener('error', () => {
+            if (this.onError) {
+              this.onError(
+                this.audio2?.error || {
+                  message: 'An unknown error occurred with the audio element',
+                },
+              );
+            }
+          });
         }
 
         audio = this.audio1;
       } else {
         if (!this.audio2) {
           this.audio2 = new Audio();
+          this.audio2.addEventListener('error', () => {
+            if (this.onError) {
+              this.onError(
+                this.audio2?.error || {
+                  message: 'An unknown error occurred with the audio element',
+                },
+              );
+            }
+          });
         }
 
         audio = this.audio2;
       }
 
-      if (this.onError && !audio.onerror) {
-        audio.onerror = (event: Event | string, _source?: string, _lineno?: number, _colno?: number, error?: Error): void => {
-          if (this.onError) {
-            this.onError(
-              error || {
-                message: `Error loading audio: ${nextTrack ? nextTrack.url : 'Unknown track :('}`,
-                event,
-                error,
-              },
-            );
-          }
-        };
-      }
-
-      audio.oncanplaythrough = (): void => {
+      audio.addEventListener('canplaythrough', () => {
         this.bufferNextTrack();
-      };
-
-      audio.onprogress = (): void => {
+      });
+      audio.addEventListener('timeupdate', () => {
         this.onPlayerProgress();
-      };
-
-      audio.onended = (): void => {
+      });
+      audio.addEventListener('ended', () => {
         this.onPlayerTrackEnd();
-      };
+      });
 
-      audio.volume = this.state.volume;
+      audio.volume = this.state.volume / 100;
       audio.src = nextTrack.url;
       audio.currentTime = 0;
+
+      if (Number.isFinite(audio.duration)) {
+        this.state.duration = audio.duration;
+      }
 
       // Destroy the previous track audio element
       if (!manualNextTrack) {
         if (this.isAudio1Active && this.audio2) {
-          this.audio2.onerror = null;
-          this.audio2.onprogress = null;
-          this.audio2.onended = null;
-          this.audio2.oncanplaythrough = null;
           this.audio2 = null;
         } else if (!this.isAudio1Active && this.audio1) {
-          this.audio1.onerror = null;
-          this.audio1.onprogress = null;
-          this.audio1.onended = null;
-          this.audio1.oncanplaythrough = null;
           this.audio1 = null;
         }
       }
@@ -487,47 +489,43 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
       if (this.isAudio1Active) {
         // Destroy previous buffer if it's not buffering the correct track
         if (this.audio2 && this.audio2.src !== nextTrack.url) {
-          this.audio2.onerror = null;
-          this.audio2.onprogress = null;
-          this.audio2.onended = null;
-          this.audio2.oncanplaythrough = null;
           this.audio2 = null;
         }
 
         if (!this.audio2) {
           this.audio2 = new Audio();
+          this.audio2.addEventListener('error', () => {
+            if (this.onError) {
+              this.onError(
+                this.audio2?.error || {
+                  message: 'An unknown error occurred with the audio element',
+                },
+              );
+            }
+          });
         }
 
         buffer = this.audio2;
       } else {
         // Destroy previous buffer if it's not buffering the correct track
         if (this.audio1 && this.audio1.src !== nextTrack.url) {
-          this.audio1.onerror = null;
-          this.audio1.onprogress = null;
-          this.audio1.onended = null;
-          this.audio1.oncanplaythrough = null;
           this.audio1 = null;
         }
 
         if (!this.audio1) {
           this.audio1 = new Audio();
+          this.audio1.addEventListener('error', () => {
+            if (this.onError) {
+              this.onError(
+                this.audio2?.error || {
+                  message: 'An unknown error occurred with the audio element',
+                },
+              );
+            }
+          });
         }
 
         buffer = this.audio1;
-      }
-
-      if (this.onError && !buffer.onerror) {
-        buffer.onerror = (event: Event | string, _source?: string, _lineno?: number, _colno?: number, error?: Error): void => {
-          if (this.onError) {
-            this.onError(
-              error || {
-                message: `Error loading audio: ${nextTrack ? nextTrack.url : 'Unknown track :('}`,
-                event,
-                error,
-              },
-            );
-          }
-        };
       }
 
       buffer.preload = 'auto';
