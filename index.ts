@@ -84,6 +84,8 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
 
   private isAudio1Active = true;
 
+  private isGaplessTransition = false;
+
   private audio1: HTMLAudioElement | null;
 
   private audio2: HTMLAudioElement | null;
@@ -355,6 +357,20 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
     if (audio) {
       this.state.position = audio.currentTime;
       this.state.duration = audio.duration;
+
+      if (!this.isGaplessTransition) {
+        const diff = audio.duration - audio.currentTime;
+        // NOTE: 0.3 is a magic number that I guessed at. Maybe this should be configurable or better calculated?
+        if (diff < 0.3 && this.state.repeatMode === RepeatMode.noRepeat) {
+          this.isGaplessTransition = true;
+          this.playNextTrack().catch((err): void => {
+            if (this.onError) {
+              this.onError(err);
+            }
+          });
+          return;
+        }
+      }
     } else {
       this.state.position = 0;
       this.state.duration = 0;
@@ -369,11 +385,16 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
         this.setRepeatMode(RepeatMode.noRepeat);
         break;
       case RepeatMode.noRepeat:
-        this.playNextTrack().catch((err): void => {
-          if (this.onError) {
-            this.onError(err);
-          }
-        });
+        if (this.isGaplessTransition) {
+          this.isGaplessTransition = false;
+        } else {
+          console.log('Playing next track!');
+          this.playNextTrack().catch((err): void => {
+            if (this.onError) {
+              this.onError(err);
+            }
+          });
+        }
         break;
       case RepeatMode.repeatFull:
       default:
@@ -404,6 +425,8 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
 
     if (nextTrack) {
       this.state.currentTrack = nextTrack;
+      const activeAudio = this.activeAudioElement;
+      const activeTrackSource = activeAudio ? activeAudio.src : '';
       this.isAudio1Active = !this.isAudio1Active;
 
       let audio: HTMLAudioElement;
@@ -458,18 +481,18 @@ export class Player<Track extends PlayerTrack = PlayerTrack> {
         this.state.duration = audio.duration;
       }
 
-      // Destroy the previous track audio element
-      if (!manualNextTrack) {
-        if (this.isAudio1Active && this.audio2) {
-          this.audio2 = null;
-        } else if (!this.isAudio1Active && this.audio1) {
-          this.audio1 = null;
-        }
-      }
-
       this.triggerOnTrackStart();
 
       await this.play();
+
+      // Destroy the previous track audio element if it hasn't changed since playing the next track
+      if (!manualNextTrack) {
+        if (this.isAudio1Active && this.audio2 && this.audio2.src === activeTrackSource) {
+          this.audio2 = null;
+        } else if (!this.isAudio1Active && this.audio1 && this.audio1.src === activeTrackSource) {
+          this.audio1 = null;
+        }
+      }
     } else if (this.state.currentTrack) {
       this.state.currentTrack = undefined;
       this.triggerOnStateChange();
