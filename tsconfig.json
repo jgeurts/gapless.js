@@ -9,6 +9,7 @@
     "inlineSourceMap": true,
 
     "esModuleInterop": true,
+    "isolatedModules": true,
 
     "outDir": ".",
     "baseUrl": ".",
